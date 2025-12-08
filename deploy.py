@@ -2,7 +2,7 @@
 Deployment script for unauthorized API call alerting.
 
 Discovers existing infrastructure and creates only missing components.
-Sets up CloudTrail, subscription filter, Lambda enricher, and SNS alerting.
+Sets up CloudTrail, metrics filter, alarm, Lambda enricher, and SNS alerting.
 
 Copyright 2025 Jason E. Robinson
 Licensed under the Apache License, Version 2.0
@@ -23,14 +23,17 @@ from botocore.exceptions import ClientError
 # Resource naming
 TRAIL_NAME = "unauth-api-trail"
 LOG_GROUP_NAME = "/aws/cloudtrail/unauth-api-trail"
-SUBSCRIPTION_FILTER_NAME = "unauth-api-filter"
+METRICS_FILTER_NAME = "unauth-api-metric"
+METRIC_NAME = "UnauthorizedAPICalls"
+METRIC_NAMESPACE = "CloudTrailMetrics"
+ALARM_NAME = "unauth-api-alarm"
 SNS_TOPIC_NAME = "unauth-api-alerts"
 LAMBDA_NAME = "ops-cloudtrail-unauthorized"
 LAMBDA_ROLE_NAME = "ops-cloudtrail-unauthorized-role"
 CLOUDTRAIL_ROLE_NAME = "unauth-api-cloudtrail-role"
 BUCKET_PREFIX = "unauth-api-cloudtrail"
 
-# Subscription filter pattern for unauthorized API calls
+# Metrics filter pattern for unauthorized API calls
 FILTER_PATTERN = '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") }'
 
 
@@ -46,6 +49,7 @@ class DeploymentContext:
         self.sts = boto3.client("sts", region_name=region)
         self.cloudtrail = boto3.client("cloudtrail", region_name=region)
         self.logs = boto3.client("logs", region_name=region)
+        self.cloudwatch = boto3.client("cloudwatch", region_name=region)
         self.sns = boto3.client("sns", region_name=region)
         self.lambda_client = boto3.client("lambda", region_name=region)
         self.iam = boto3.client("iam", region_name=region)
@@ -116,24 +120,44 @@ def find_log_group(ctx: DeploymentContext, name: str) -> dict:
         return {}
 
 
-def find_subscription_filter(ctx: DeploymentContext, log_group: str) -> dict:
-    """Find existing subscription filter on log group.
+def find_metrics_filter(ctx: DeploymentContext, log_group: str) -> dict:
+    """Find existing metrics filter on log group.
 
     Returns:
         dict with filter info, or empty dict if not found.
     """
     try:
-        response = ctx.logs.describe_subscription_filters(logGroupName=log_group)
-        filters = response.get("subscriptionFilters", [])
+        response = ctx.logs.describe_metric_filters(logGroupName=log_group)
+        filters = response.get("metricFilters", [])
 
         for f in filters:
-            if f.get("filterName") == SUBSCRIPTION_FILTER_NAME:
-                log(f"Found subscription filter: {SUBSCRIPTION_FILTER_NAME}")
+            if f.get("filterName") == METRICS_FILTER_NAME:
+                log(f"Found metrics filter: {METRICS_FILTER_NAME}")
                 return f
 
         return {}
     except ClientError as err:
-        log(f"Error checking subscription filters: {err}")
+        log(f"Error checking metrics filters: {err}")
+        return {}
+
+
+def find_alarm(ctx: DeploymentContext, name: str) -> dict:
+    """Find existing CloudWatch alarm.
+
+    Returns:
+        dict with alarm info, or empty dict if not found.
+    """
+    try:
+        response = ctx.cloudwatch.describe_alarms(AlarmNames=[name])
+        alarms = response.get("MetricAlarms", [])
+
+        if alarms:
+            log(f"Found alarm: {name}")
+            return alarms[0]
+
+        return {}
+    except ClientError as err:
+        log(f"Error checking alarm: {err}")
         return {}
 
 
@@ -387,6 +411,57 @@ def create_cloudtrail(ctx: DeploymentContext, bucket: str, log_group_arn: str, r
         raise RuntimeError(f"Failed to create CloudTrail: {err}") from err
 
 
+def create_metrics_filter(ctx: DeploymentContext, log_group: str):
+    """Create metrics filter for unauthorized API calls."""
+    if ctx.dry_run:
+        log(f"Would create metrics filter: {METRICS_FILTER_NAME}", dry_run=True)
+        return
+
+    try:
+        ctx.logs.put_metric_filter(
+            logGroupName=log_group,
+            filterName=METRICS_FILTER_NAME,
+            filterPattern=FILTER_PATTERN,
+            metricTransformations=[
+                {
+                    "metricName": METRIC_NAME,
+                    "metricNamespace": METRIC_NAMESPACE,
+                    "metricValue": "1",
+                    "defaultValue": 0,
+                }
+            ],
+        )
+        log(f"Created metrics filter: {METRICS_FILTER_NAME}")
+    except ClientError as err:
+        raise RuntimeError(f"Failed to create metrics filter: {err}") from err
+
+
+def create_alarm(ctx: DeploymentContext, sns_topic_arn: str):
+    """Create CloudWatch alarm for unauthorized API calls."""
+    if ctx.dry_run:
+        log(f"Would create alarm: {ALARM_NAME}", dry_run=True)
+        return
+
+    try:
+        ctx.cloudwatch.put_metric_alarm(
+            AlarmName=ALARM_NAME,
+            AlarmDescription="Alarm for unauthorized API calls (AccessDenied/UnauthorizedOperation)",
+            MetricName=METRIC_NAME,
+            Namespace=METRIC_NAMESPACE,
+            Statistic="Sum",
+            Period=300,
+            EvaluationPeriods=1,
+            Threshold=1,
+            ComparisonOperator="GreaterThanOrEqualToThreshold",
+            TreatMissingData="notBreaching",
+            AlarmActions=[sns_topic_arn],
+            OKActions=[],
+        )
+        log(f"Created alarm: {ALARM_NAME}")
+    except ClientError as err:
+        raise RuntimeError(f"Failed to create alarm: {err}") from err
+
+
 def create_sns_topic(ctx: DeploymentContext, name: str) -> str:
     """Create SNS topic.
 
@@ -450,13 +525,13 @@ def create_lambda_role(ctx: DeploymentContext) -> str:
             PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
         )
 
-        # Inline policy for Logs Insights and SNS
+        # Inline policy for FilterLogEvents and SNS
         inline_policy = {
             "Version": "2012-10-17",
             "Statement": [
                 {
                     "Effect": "Allow",
-                    "Action": ["logs:StartQuery", "logs:GetQueryResults"],
+                    "Action": "logs:FilterLogEvents",
                     "Resource": "*",
                 },
                 {
@@ -469,7 +544,7 @@ def create_lambda_role(ctx: DeploymentContext) -> str:
 
         ctx.iam.put_role_policy(
             RoleName=LAMBDA_ROLE_NAME,
-            PolicyName="LogsInsightsAndSNS",
+            PolicyName="FilterLogEventsAndSNS",
             PolicyDocument=json.dumps(inline_policy),
         )
 
@@ -564,34 +639,27 @@ def create_lambda(ctx: DeploymentContext, role_arn: str) -> str:
             # Wait for function to be active
             time.sleep(5)
 
-        # Set reserved concurrency to 1
-        ctx.lambda_client.put_function_concurrency(
-            FunctionName=LAMBDA_NAME,
-            ReservedConcurrentExecutions=1,
-        )
-        log(f"Set reserved concurrency to 1: {LAMBDA_NAME}")
-
         return function_arn
 
     except ClientError as err:
         raise RuntimeError(f"Failed to create/update Lambda: {err}") from err
 
 
-def add_lambda_invoke_permission(ctx: DeploymentContext, lambda_arn: str, log_group_arn: str):
-    """Add permission for CloudWatch Logs to invoke Lambda."""
+def add_sns_invoke_permission(ctx: DeploymentContext, lambda_arn: str, sns_topic_arn: str):
+    """Add permission for SNS to invoke Lambda."""
     if ctx.dry_run:
-        log("Would add Lambda invoke permission for CloudWatch Logs", dry_run=True)
+        log("Would add Lambda invoke permission for SNS", dry_run=True)
         return
 
     try:
         ctx.lambda_client.add_permission(
             FunctionName=LAMBDA_NAME,
-            StatementId="CloudWatchLogsInvoke",
+            StatementId="SNSInvoke",
             Action="lambda:InvokeFunction",
-            Principal="logs.amazonaws.com",
-            SourceArn=log_group_arn,
+            Principal="sns.amazonaws.com",
+            SourceArn=sns_topic_arn,
         )
-        log("Added Lambda invoke permission for CloudWatch Logs")
+        log("Added Lambda invoke permission for SNS")
     except ClientError as err:
         if err.response.get("Error", {}).get("Code") == "ResourceConflictException":
             log("Lambda invoke permission already exists")
@@ -599,22 +667,28 @@ def add_lambda_invoke_permission(ctx: DeploymentContext, lambda_arn: str, log_gr
         raise RuntimeError(f"Failed to add Lambda permission: {err}") from err
 
 
-def create_subscription_filter(ctx: DeploymentContext, log_group: str, lambda_arn: str):
-    """Create subscription filter to trigger Lambda."""
+def subscribe_lambda_to_sns(ctx: DeploymentContext, sns_topic_arn: str, lambda_arn: str):
+    """Subscribe Lambda to SNS topic for alarm notifications."""
     if ctx.dry_run:
-        log(f"Would create subscription filter: {SUBSCRIPTION_FILTER_NAME}", dry_run=True)
+        log("Would subscribe Lambda to SNS topic", dry_run=True)
         return
 
     try:
-        ctx.logs.put_subscription_filter(
-            logGroupName=log_group,
-            filterName=SUBSCRIPTION_FILTER_NAME,
-            filterPattern=FILTER_PATTERN,
-            destinationArn=lambda_arn,
+        # Check for existing subscription
+        response = ctx.sns.list_subscriptions_by_topic(TopicArn=sns_topic_arn)
+        for sub in response.get("Subscriptions", []):
+            if sub.get("Protocol") == "lambda" and sub.get("Endpoint") == lambda_arn:
+                log("Lambda already subscribed to SNS topic")
+                return
+
+        ctx.sns.subscribe(
+            TopicArn=sns_topic_arn,
+            Protocol="lambda",
+            Endpoint=lambda_arn,
         )
-        log(f"Created subscription filter: {SUBSCRIPTION_FILTER_NAME}")
+        log("Subscribed Lambda to SNS topic")
     except ClientError as err:
-        raise RuntimeError(f"Failed to create subscription filter: {err}") from err
+        raise RuntimeError(f"Failed to subscribe Lambda to SNS: {err}") from err
 
 
 def subscribe_email(ctx: DeploymentContext, topic_arn: str, email: str):
@@ -686,8 +760,15 @@ def deploy(ctx: DeploymentContext, email: str):
 
     log("")
 
-    # Step 2: Create SNS topic
-    log("Step 2: Setting up SNS topic...")
+    # Step 2: Create metrics filter
+    log("Step 2: Setting up metrics filter...")
+    existing_filter = find_metrics_filter(ctx, ctx.log_group_name)
+    if not existing_filter:
+        create_metrics_filter(ctx, ctx.log_group_name)
+    log("")
+
+    # Step 3: Create SNS topic
+    log("Step 3: Setting up SNS topic...")
     existing_topic = find_sns_topic(ctx, SNS_TOPIC_NAME)
     if existing_topic:
         ctx.sns_topic_arn = existing_topic.get("TopicArn", "")
@@ -695,26 +776,27 @@ def deploy(ctx: DeploymentContext, email: str):
         ctx.sns_topic_arn = create_sns_topic(ctx, SNS_TOPIC_NAME)
     log("")
 
-    # Step 3: Create Lambda role and function
-    log("Step 3: Setting up Lambda function...")
+    # Step 4: Create CloudWatch alarm
+    log("Step 4: Setting up CloudWatch alarm...")
+    existing_alarm = find_alarm(ctx, ALARM_NAME)
+    if not existing_alarm:
+        create_alarm(ctx, ctx.sns_topic_arn)
+    log("")
+
+    # Step 5: Create Lambda role and function
+    log("Step 5: Setting up Lambda function...")
     ctx.lambda_role_arn = create_lambda_role(ctx)
     ctx.lambda_arn = create_lambda(ctx, ctx.lambda_role_arn)
     log("")
 
-    # Step 4: Add Lambda invoke permission
-    log("Step 4: Configuring Lambda permissions...")
-    add_lambda_invoke_permission(ctx, ctx.lambda_arn, ctx.log_group_arn)
+    # Step 6: Subscribe Lambda to SNS
+    log("Step 6: Configuring Lambda trigger...")
+    add_sns_invoke_permission(ctx, ctx.lambda_arn, ctx.sns_topic_arn)
+    subscribe_lambda_to_sns(ctx, ctx.sns_topic_arn, ctx.lambda_arn)
     log("")
 
-    # Step 5: Create subscription filter
-    log("Step 5: Setting up subscription filter...")
-    existing_filter = find_subscription_filter(ctx, ctx.log_group_name)
-    if not existing_filter:
-        create_subscription_filter(ctx, ctx.log_group_name, ctx.lambda_arn)
-    log("")
-
-    # Step 6: Subscribe email
-    log("Step 6: Setting up email subscription...")
+    # Step 7: Subscribe email to enriched alerts
+    log("Step 7: Setting up email subscription...")
     if email:
         subscribe_email(ctx, ctx.sns_topic_arn, email)
     else:

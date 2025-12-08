@@ -14,10 +14,11 @@ Confirm the email subscription when you receive it.
 
 ## What It Does
 
-1. **Discovers** existing CloudTrail and log groups
-2. **Creates** only missing components
-3. **Deploys** Lambda with subscription filter trigger
-4. **Sends** enriched alerts with actionable details
+1. **Discovers** existing CloudTrail, log groups, and metrics filters
+2. **Creates** only missing components (metrics filter, alarm, Lambda)
+3. **Triggers** Lambda via CloudWatch Alarm when unauthorized calls detected
+4. **Queries** CloudWatch Logs for event details using filter_log_events
+5. **Sends** enriched alerts with actionable details
 
 ## Enriched Alert Output
 
@@ -84,7 +85,8 @@ aws logs tail /aws/lambda/ops-cloudtrail-unauthorized --since 10m --follow
 ## Required IAM Permissions
 
 - cloudtrail:DescribeTrails, CreateTrail, StartLogging
-- logs:DescribeLogGroups, CreateLogGroup, DescribeSubscriptionFilters, PutSubscriptionFilter
+- logs:DescribeLogGroups, CreateLogGroup, DescribeMetricFilters, PutMetricFilter, FilterLogEvents
+- cloudwatch:DescribeAlarms, PutMetricAlarm
 - sns:CreateTopic, Subscribe, ListSubscriptionsByTopic, GetTopicAttributes, ListTopics
 - lambda:GetFunction, CreateFunction, UpdateFunctionCode, UpdateFunctionConfiguration, AddPermission
 - iam:GetRole, CreateRole, PutRolePolicy, AttachRolePolicy
@@ -97,7 +99,8 @@ aws logs tail /aws/lambda/ops-cloudtrail-unauthorized --since 10m --follow
 |-----------|-----------|------------|
 | CloudTrail | Use existing | Create with CloudWatch Logs |
 | CloudWatch Log Group | Use existing | Create (no retention set) |
+| Metrics Filter | Use existing | Create for unauthorized API detection |
+| CloudWatch Alarm | Use existing | Create to trigger on metrics filter |
 | Lambda Enricher | Update code | Create function and role |
-| Subscription Filter | Use existing | Create to trigger Lambda |
 | SNS Topic | Use existing | Create for alerts |
 | Email Subscription | Skip if exists | Create and require confirmation |

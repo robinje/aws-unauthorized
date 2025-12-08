@@ -2,21 +2,22 @@
 Lambda function for enriching unauthorized API call alerts.
 
 Function name: ops-cloudtrail-unauthorized
-Trigger: CloudWatch Logs subscription filter on unauthorized API events
+Trigger: CloudWatch Alarm (via SNS) from metrics filter
 
-Triggered by subscription filter matching AccessDenied/UnauthorizedOperation
-events in CloudTrail logs. Queries the last N minutes via Logs Insights to
-aggregate events, then publishes enriched alert with service, IP, and
-principal details to SNS for email delivery.
+Triggered by CloudWatch Alarm when metrics filter detects AccessDenied or
+UnauthorizedOperation events. Queries CloudWatch Logs for the last N minutes
+using filter_log_events, aggregates events, then publishes enriched alert
+with service, IP, and principal details to SNS for email delivery.
 
 Copyright 2025 Jason E. Robinson
 Licensed under the Apache License, Version 2.0
 https://www.apache.org/licenses/LICENSE-2.0
 """
 
+import json
 import logging
 import os
-import time
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import boto3
@@ -42,28 +43,21 @@ logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
 logs_client = boto3.client("logs")
 sns_client = boto3.client("sns")
 
-# Logs Insights query for unauthorized API calls
-QUERY_TEMPLATE = """
-fields @timestamp, eventSource, eventName, sourceIPAddress,
-       userIdentity.arn as principalArn, errorCode
-| filter errorCode like /UnauthorizedOperation|AccessDenied/
-| stats count(*) as attempts by eventSource, eventName, sourceIPAddress, principalArn, errorCode
-| sort attempts desc
-| limit 50
-"""
+# Filter pattern for unauthorized API calls (CloudWatch Logs filter syntax)
+FILTER_PATTERN = '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") }'
 
 
-def run_logs_insights_query() -> list:
-    """Execute Logs Insights query and poll for results.
+def query_unauthorized_events() -> list:
+    """Query CloudWatch Logs for unauthorized events using filter_log_events.
 
     Returns:
-        list of query result rows.
+        list of parsed CloudTrail events.
     """
-    end_time = int(datetime.now(timezone.utc).timestamp())
-    start_time = end_time - (QUERY_WINDOW_MINUTES * 60)
+    end_time = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_time = end_time - (QUERY_WINDOW_MINUTES * 60 * 1000)
 
     logger.info(
-        "Running Logs Insights query",
+        "Querying CloudWatch Logs",
         extra={
             "log_group": LOG_GROUP_NAME,
             "start_time": start_time,
@@ -72,45 +66,85 @@ def run_logs_insights_query() -> list:
         },
     )
 
+    events = []
+    next_token = None
+
     try:
-        response = logs_client.start_query(
-            logGroupName=LOG_GROUP_NAME,
-            startTime=start_time,
-            endTime=end_time,
-            queryString=QUERY_TEMPLATE.strip(),
-        )
-        query_id = response.get("queryId")
+        while True:
+            params = {
+                "logGroupName": LOG_GROUP_NAME,
+                "startTime": start_time,
+                "endTime": end_time,
+                "filterPattern": FILTER_PATTERN,
+                "limit": 100,
+            }
+            if next_token:
+                params["nextToken"] = next_token
+
+            response = logs_client.filter_log_events(**params)
+
+            for event in response.get("events", []):
+                message = event.get("message", "")
+                try:
+                    parsed = json.loads(message)
+                    events.append(parsed)
+                except json.JSONDecodeError:
+                    logger.warning("Failed to parse event: %s", message[:100])
+
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+
+            # Limit total events to prevent runaway queries
+            if len(events) >= 500:
+                logger.warning("Reached event limit, stopping query")
+                break
+
     except ClientError as err:
-        logger.error("Failed to start query: %s", err)
-        raise RuntimeError(f"Failed to start Logs Insights query: {err}") from err
+        logger.error("Failed to query logs: %s", err)
+        raise RuntimeError(f"Failed to query CloudWatch Logs: {err}") from err
 
-    if not query_id:
-        logger.error("No queryId returned from start_query")
-        raise RuntimeError("Failed to start Logs Insights query: no queryId returned")
+    logger.info("Retrieved %d events", len(events))
+    return events
 
-    # Poll for results
-    max_attempts = 30
-    poll_interval = 1
 
-    for _ in range(max_attempts):
-        try:
-            result = logs_client.get_query_results(queryId=query_id)
-            status = result.get("status", "")
+def aggregate_events(events: list) -> list:
+    """Aggregate events by service, API, IP, principal, and error code.
 
-            if status == "Complete":
-                return result.get("results", [])
-            elif status in ("Failed", "Cancelled", "Timeout"):
-                logger.error("Query %s: %s", status, query_id)
-                raise RuntimeError(f"Logs Insights query {status}: {query_id}")
+    Args:
+        events: List of parsed CloudTrail events.
 
-            time.sleep(poll_interval)
+    Returns:
+        list of aggregated rows sorted by count descending.
+    """
+    aggregation = defaultdict(int)
 
-        except ClientError as err:
-            logger.error("Failed to get query results: %s", err)
-            raise RuntimeError(f"Failed to get query results: {err}") from err
+    for event in events:
+        key = (
+            event.get("eventSource", "-"),
+            event.get("eventName", "-"),
+            event.get("sourceIPAddress", "-"),
+            event.get("userIdentity", {}).get("arn", "-"),
+            event.get("errorCode", "-"),
+        )
+        aggregation[key] += 1
 
-    logger.error("Query timed out after %d attempts", max_attempts)
-    raise RuntimeError(f"Logs Insights query timed out: {query_id}")
+    rows = []
+    for key, count in aggregation.items():
+        rows.append({
+            "eventSource": key[0],
+            "eventName": key[1],
+            "sourceIPAddress": key[2],
+            "principalArn": key[3],
+            "errorCode": key[4],
+            "count": count,
+        })
+
+    # Sort by count descending
+    rows.sort(key=lambda x: x.get("count", 0), reverse=True)
+
+    # Limit to top 50
+    return rows[:50]
 
 
 def truncate_arn(arn: str, max_length: int = 40) -> str:
@@ -127,14 +161,15 @@ def truncate_arn(arn: str, max_length: int = 40) -> str:
         return arn or "-"
 
     # Keep the meaningful part (usually user/role name at the end)
-    return "..." + arn[-(max_length - 3) :]
+    return "..." + arn[-(max_length - 3):]
 
 
-def format_enriched_message(query_results: list) -> str:
+def format_enriched_message(aggregated: list, total_events: int) -> str:
     """Build human-readable enriched message.
 
     Args:
-        query_results: Results from Logs Insights query.
+        aggregated: Aggregated event rows.
+        total_events: Total number of events before aggregation.
 
     Returns:
         Formatted message string for email.
@@ -149,41 +184,18 @@ def format_enriched_message(query_results: list) -> str:
         tz=timezone.utc,
     )
 
-    # Aggregate statistics
-    total_events = 0
+    # Collect unique IPs and principals
     unique_ips = set()
     unique_principals = set()
-    rows = []
 
-    for result in query_results:
-        row_data = {}
-        for field in result:
-            row_data[field.get("field", "")] = field.get("value", "")
-
-        try:
-            attempts = int(row_data.get("attempts", "0"))
-        except (ValueError, TypeError):
-            attempts = 0
-        total_events += attempts
-
-        source_ip = row_data.get("sourceIPAddress", "-")
-        principal = row_data.get("principalArn", "-")
+    for row in aggregated:
+        source_ip = row.get("sourceIPAddress", "-")
+        principal = row.get("principalArn", "-")
 
         if source_ip and source_ip != "-":
             unique_ips.add(source_ip)
         if principal and principal != "-":
             unique_principals.add(principal)
-
-        rows.append(
-            {
-                "eventSource": row_data.get("eventSource", "-"),
-                "eventName": row_data.get("eventName", "-"),
-                "sourceIPAddress": source_ip,
-                "principalArn": principal,
-                "errorCode": row_data.get("errorCode", "-"),
-                "attempts": attempts,
-            }
-        )
 
     # Build message
     lines = [
@@ -200,20 +212,20 @@ def format_enriched_message(query_results: list) -> str:
         "",
     ]
 
-    if rows:
+    if aggregated:
         # Header
         lines.append("Details:")
         lines.append(f"{'Service':<20} {'API':<20} {'IP':<16} {'Principal':<40} {'Error':<16} {'Count':>5}")
 
         # Data rows
-        for row in rows:
+        for row in aggregated:
             lines.append(
                 f"{row.get('eventSource', '-'):<20} "
                 f"{row.get('eventName', '-'):<20} "
                 f"{row.get('sourceIPAddress', '-'):<16} "
                 f"{truncate_arn(row.get('principalArn', '-')):<40} "
                 f"{row.get('errorCode', '-'):<16} "
-                f"{row.get('attempts', 0):>5}"
+                f"{row.get('count', 0):>5}"
             )
     else:
         lines.append("No detailed events found in query window.")
@@ -246,18 +258,19 @@ def lambda_handler(event: dict, context) -> dict:
 
     Function name: ops-cloudtrail-unauthorized
 
-    Triggered by subscription filter. The event contents are ignored - we query
-    Logs Insights for the full picture over the configured time window.
+    Triggered by CloudWatch Alarm via SNS when metrics filter threshold crossed.
+    The alarm event is not parsed - we query CloudWatch Logs directly for the
+    full picture over the configured time window.
 
     Args:
-        event: Subscription filter event (ignored, just triggers the query).
+        event: SNS event from CloudWatch Alarm (not parsed, just triggers query).
         context: Lambda context.
 
     Returns:
         dict with statusCode and body.
     """
-    logger.debug(
-        "Triggered by subscription filter",
+    logger.info(
+        "Triggered by CloudWatch Alarm",
         extra={
             "function_name": getattr(context, "function_name", "unknown"),
             "request_id": getattr(context, "aws_request_id", "unknown"),
@@ -273,10 +286,11 @@ def lambda_handler(event: dict, context) -> dict:
         return {"statusCode": 500, "body": "Configuration error: ENRICHED_TOPIC_ARN not set"}
 
     try:
-        query_results = run_logs_insights_query()
-        enriched_message = format_enriched_message(query_results)
+        events = query_unauthorized_events()
+        aggregated = aggregate_events(events)
+        enriched_message = format_enriched_message(aggregated, len(events))
         publish_enriched_alert(enriched_message)
-        logger.debug("Enriched alert published successfully")
+        logger.info("Enriched alert published successfully")
         return {"statusCode": 200, "body": "Published"}
     except ClientError as err:
         logger.error("AWS API error: %s", err)
