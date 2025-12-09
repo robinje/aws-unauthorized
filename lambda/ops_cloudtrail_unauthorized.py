@@ -28,7 +28,7 @@ logger = logging.getLogger()
 # Environment configuration
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 LOG_GROUP_NAME = os.environ.get("LOG_GROUP_NAME", "")
-ENRICHED_TOPIC_ARN = os.environ.get("ENRICHED_TOPIC_ARN", "")
+REPORT_TOPIC_ARN = os.environ.get("REPORT_TOPIC_ARN", "")
 AWS_REGION = os.environ.get("AWS_REGION", "")
 AWS_ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID", "")
 
@@ -164,8 +164,8 @@ def truncate_arn(arn: str, max_length: int = 40) -> str:
     return "..." + arn[-(max_length - 3):]
 
 
-def format_enriched_message(aggregated: list, total_events: int) -> str:
-    """Build human-readable enriched message.
+def format_report(aggregated: list, total_events: int) -> str:
+    """Build human-readable report message.
 
     Args:
         aggregated: Aggregated event rows.
@@ -233,24 +233,22 @@ def format_enriched_message(aggregated: list, total_events: int) -> str:
     return "\n".join(lines)
 
 
-def publish_enriched_alert(message: str):
-    """Publish enriched message to SNS topic.
+def publish_report(message: str):
+    """Publish report to SNS topic.
 
     Args:
-        message: Formatted enriched message.
+        message: Formatted report message.
     """
-    subject = "AWS Alert: Unauthorized API Calls"
-
     try:
         sns_client.publish(
-            TopicArn=ENRICHED_TOPIC_ARN,
-            Subject=subject,
+            TopicArn=REPORT_TOPIC_ARN,
+            Subject="AWS Alert: Unauthorized API Calls",
             Message=message,
         )
-        logger.info("Published enriched alert to %s", ENRICHED_TOPIC_ARN)
+        logger.info("Published report to %s", REPORT_TOPIC_ARN)
     except ClientError as err:
         logger.error("Failed to publish to SNS: %s", err)
-        raise RuntimeError(f"Failed to publish enriched alert: {err}") from err
+        raise RuntimeError(f"Failed to publish report: {err}") from err
 
 
 def lambda_handler(event: dict, context) -> dict:
@@ -281,16 +279,16 @@ def lambda_handler(event: dict, context) -> dict:
     if not LOG_GROUP_NAME:
         logger.error("LOG_GROUP_NAME environment variable not set")
         return {"statusCode": 500, "body": "Configuration error: LOG_GROUP_NAME not set"}
-    if not ENRICHED_TOPIC_ARN:
-        logger.error("ENRICHED_TOPIC_ARN environment variable not set")
-        return {"statusCode": 500, "body": "Configuration error: ENRICHED_TOPIC_ARN not set"}
+    if not REPORT_TOPIC_ARN:
+        logger.error("REPORT_TOPIC_ARN environment variable not set")
+        return {"statusCode": 500, "body": "Configuration error: REPORT_TOPIC_ARN not set"}
 
     try:
         events = query_unauthorized_events()
         aggregated = aggregate_events(events)
-        enriched_message = format_enriched_message(aggregated, len(events))
-        publish_enriched_alert(enriched_message)
-        logger.info("Enriched alert published successfully")
+        message = format_report(aggregated, len(events))
+        publish_report(message)
+        logger.info("Report published successfully")
         return {"statusCode": 200, "body": "Published"}
     except ClientError as err:
         logger.error("AWS API error: %s", err)
@@ -298,3 +296,6 @@ def lambda_handler(event: dict, context) -> dict:
     except RuntimeError as err:
         logger.error("Processing error: %s", err)
         return {"statusCode": 500, "body": str(err)}
+    except Exception as err:
+        logger.error("Unexpected error: %s", err)
+        return {"statusCode": 500, "body": f"Unexpected error: {err}"}
