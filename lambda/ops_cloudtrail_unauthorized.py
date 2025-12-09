@@ -44,7 +44,7 @@ logs_client = boto3.client("logs")
 sns_client = boto3.client("sns")
 
 # Filter pattern for unauthorized API calls (CloudWatch Logs filter syntax)
-FILTER_PATTERN = '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") }'
+FILTER_PATTERN = '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") || ($.errorCode = "*AccessDenied*") }'
 
 
 def query_unauthorized_events() -> list:
@@ -285,6 +285,9 @@ def lambda_handler(event: dict, context) -> dict:
 
     try:
         events = query_unauthorized_events()
+        if not events:
+            logger.info("No events found in query window, skipping report")
+            return {"statusCode": 200, "body": "No events found"}
         aggregated = aggregate_events(events)
         message = format_report(aggregated, len(events))
         publish_report(message)

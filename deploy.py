@@ -69,6 +69,8 @@ def create_sns_topics(ctx: DeploymentContext, email: str):
     """Create alarm topic (Lambda subscribes) and report topic (email subscribes)."""
     if ctx.dry_run:
         log(f"Would create SNS topics: {ALARM_TOPIC_NAME}, {REPORT_TOPIC_NAME}", dry_run=True)
+        if email:
+            log(f"Would subscribe email: {email}", dry_run=True)
         ctx.alarm_topic_arn = f"arn:aws:sns:{ctx.region}:{ctx.get_account_id()}:{ALARM_TOPIC_NAME}"
         ctx.report_topic_arn = f"arn:aws:sns:{ctx.region}:{ctx.get_account_id()}:{REPORT_TOPIC_NAME}"
         return
@@ -134,8 +136,10 @@ def create_lambda_role(ctx: DeploymentContext) -> str:
             RoleName=LAMBDA_ROLE_NAME,
             PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
         )
-    except ClientError:
-        pass
+    except ClientError as err:
+        if "PolicyNotAttachable" in str(err):
+            raise
+        log(f"Policy already attached or no change needed: {LAMBDA_ROLE_NAME}")
 
     # Inline policy for logs and SNS
     inline_policy = {
@@ -195,8 +199,10 @@ def create_lambda(ctx: DeploymentContext):
         }
     }
 
+    arn = ""
     try:
         response = ctx.lambda_client.get_function(FunctionName=LAMBDA_FUNCTION_NAME)
+        arn = response.get("Configuration", {}).get("FunctionArn", "")
         # Update existing
         ctx.lambda_client.update_function_code(FunctionName=LAMBDA_FUNCTION_NAME, ZipFile=zip_bytes)
         time.sleep(2)
@@ -209,7 +215,6 @@ def create_lambda(ctx: DeploymentContext):
             MemorySize=256,
             Environment=environment,
         )
-        arn = response.get("Configuration", {}).get("FunctionArn", "")
         log(f"Updated Lambda: {LAMBDA_FUNCTION_NAME}")
     except ClientError as err:
         if "ResourceNotFoundException" in str(err):
@@ -238,11 +243,18 @@ def create_lambda(ctx: DeploymentContext):
         else:
             raise
 
+    # Wait for Lambda to be active before adding permissions
+    log("Waiting for Lambda to become active...")
+    waiter = ctx.lambda_client.get_waiter("function_active")
+    waiter.wait(FunctionName=LAMBDA_FUNCTION_NAME)
+
     # Add SNS permission for alarm topic to invoke Lambda
     try:
         ctx.lambda_client.remove_permission(FunctionName=LAMBDA_FUNCTION_NAME, StatementId="sns-invoke")
-    except ClientError:
-        pass
+        log("Removed existing SNS invoke permission")
+    except ClientError as err:
+        if "ResourceNotFoundException" not in str(err):
+            log(f"Could not remove existing permission: {err}")
 
     ctx.lambda_client.add_permission(
         FunctionName=LAMBDA_FUNCTION_NAME,
@@ -268,7 +280,7 @@ def create_metric_filter(ctx: DeploymentContext):
         log(f"Would create metric filter: {METRIC_FILTER_NAME}", dry_run=True)
         return
 
-    filter_pattern = '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") }'
+    filter_pattern = '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") || ($.errorCode = "*AccessDenied*") }'
 
     ctx.logs.put_metric_filter(
         logGroupName=ctx.log_group_name,
@@ -313,8 +325,11 @@ def delete_alarm(ctx: DeploymentContext):
     try:
         ctx.cloudwatch.delete_alarms(AlarmNames=[ALARM_NAME])
         log(f"Deleted alarm: {ALARM_NAME}")
-    except ClientError:
-        log(f"Alarm not found: {ALARM_NAME}")
+    except ClientError as err:
+        if "ResourceNotFound" in str(err):
+            log(f"Alarm not found: {ALARM_NAME}")
+        else:
+            log(f"Failed to delete alarm {ALARM_NAME}: {err}")
 
 
 def delete_metric_filter(ctx: DeploymentContext):
@@ -323,13 +338,17 @@ def delete_metric_filter(ctx: DeploymentContext):
         try:
             get_cloudtrail_log_group(ctx)
         except RuntimeError:
+            log("CloudTrail log group not found, skipping metric filter deletion")
             return
 
     try:
         ctx.logs.delete_metric_filter(logGroupName=ctx.log_group_name, filterName=METRIC_FILTER_NAME)
         log(f"Deleted metric filter: {METRIC_FILTER_NAME}")
-    except ClientError:
-        log(f"Metric filter not found: {METRIC_FILTER_NAME}")
+    except ClientError as err:
+        if "ResourceNotFoundException" in str(err):
+            log(f"Metric filter not found: {METRIC_FILTER_NAME}")
+        else:
+            log(f"Failed to delete metric filter {METRIC_FILTER_NAME}: {err}")
 
 
 def delete_lambda(ctx: DeploymentContext):
@@ -337,8 +356,11 @@ def delete_lambda(ctx: DeploymentContext):
     try:
         ctx.lambda_client.delete_function(FunctionName=LAMBDA_FUNCTION_NAME)
         log(f"Deleted Lambda: {LAMBDA_FUNCTION_NAME}")
-    except ClientError:
-        log(f"Lambda not found: {LAMBDA_FUNCTION_NAME}")
+    except ClientError as err:
+        if "ResourceNotFoundException" in str(err):
+            log(f"Lambda not found: {LAMBDA_FUNCTION_NAME}")
+        else:
+            log(f"Failed to delete Lambda {LAMBDA_FUNCTION_NAME}: {err}")
 
 
 def delete_lambda_role(ctx: DeploymentContext):
@@ -349,31 +371,41 @@ def delete_lambda_role(ctx: DeploymentContext):
             RoleName=LAMBDA_ROLE_NAME,
             PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
         )
-    except ClientError:
-        pass
+        log(f"Detached managed policy from {LAMBDA_ROLE_NAME}")
+    except ClientError as err:
+        if "NoSuchEntity" not in str(err):
+            log(f"Failed to detach managed policy: {err}")
 
     try:
         # Delete inline policies
         ctx.iam.delete_role_policy(RoleName=LAMBDA_ROLE_NAME, PolicyName="FilterLogEventsAndSNS")
-    except ClientError:
-        pass
+        log(f"Deleted inline policy from {LAMBDA_ROLE_NAME}")
+    except ClientError as err:
+        if "NoSuchEntity" not in str(err):
+            log(f"Failed to delete inline policy: {err}")
 
     try:
         ctx.iam.delete_role(RoleName=LAMBDA_ROLE_NAME)
         log(f"Deleted IAM role: {LAMBDA_ROLE_NAME}")
-    except ClientError:
-        log(f"IAM role not found: {LAMBDA_ROLE_NAME}")
+    except ClientError as err:
+        if "NoSuchEntity" in str(err):
+            log(f"IAM role not found: {LAMBDA_ROLE_NAME}")
+        else:
+            log(f"Failed to delete IAM role {LAMBDA_ROLE_NAME}: {err}")
 
 
 def delete_sns_topics(ctx: DeploymentContext):
-    """Delete both SNS topics."""
+    """Delete both SNS topics (alarm and report are separate)."""
     for name in [ALARM_TOPIC_NAME, REPORT_TOPIC_NAME]:
         topic_arn = f"arn:aws:sns:{ctx.region}:{ctx.get_account_id()}:{name}"
         try:
             ctx.sns.delete_topic(TopicArn=topic_arn)
-            log(f"Deleted: {name}")
-        except ClientError:
-            pass
+            log(f"Deleted SNS topic: {name}")
+        except ClientError as err:
+            if "NotFound" in str(err):
+                log(f"SNS topic not found: {name}")
+            else:
+                log(f"Failed to delete SNS topic {name}: {err}")
 
 
 def get_cloudtrail_log_group(ctx: DeploymentContext):
@@ -382,29 +414,69 @@ def get_cloudtrail_log_group(ctx: DeploymentContext):
     for trail in response.get("trailList", []):
         arn = trail.get("CloudWatchLogsLogGroupArn", "")
         if arn:
+            # ARN format: arn:aws:logs:region:account:log-group:name:*
+            # Log group name may contain colons, so join everything after index 6
             parts = arn.split(":")
             if len(parts) >= 7:
                 ctx.log_group_arn = arn
-                ctx.log_group_name = parts[6]
+                # Join parts 6+ and strip trailing :* suffix
+                log_group_name = ":".join(parts[6:])
+                if log_group_name.endswith(":*"):
+                    log_group_name = log_group_name[:-2]
+                ctx.log_group_name = log_group_name
                 return
     raise RuntimeError("CloudTrail with CloudWatch Logs not configured")
 
 
 def deploy(ctx: DeploymentContext, email: str):
-    """Deploy all resources."""
+    """Deploy all resources with rollback on failure."""
     get_cloudtrail_log_group(ctx)
     log(f"Region: {ctx.region}, Account: {ctx.get_account_id()}")
     log(f"Log group: {ctx.log_group_name}")
 
-    # Create resources
-    create_sns_topics(ctx, email)
-    ctx.role_arn = create_lambda_role(ctx)
-    create_lambda(ctx)
-    create_metric_filter(ctx)
-    create_alarm(ctx)
+    try:
+        create_sns_topics(ctx, email)
+        ctx.role_arn = create_lambda_role(ctx)
+        create_lambda(ctx)
+        create_metric_filter(ctx)
+        create_alarm(ctx)
+    except (ClientError, RuntimeError) as err:
+        log(f"Deployment failed: {err}")
+        log("Rolling back created resources...")
+        delete(ctx)
+        raise RuntimeError(f"Deployment failed and rolled back: {err}") from err
 
     log("Deployment complete")
     log("Confirm the SNS email subscription to receive alerts")
+
+
+def remove_email_subscription(ctx: DeploymentContext, email: str):
+    """Remove an email subscription from the report topic."""
+    if ctx.dry_run:
+        log(f"Would remove email subscription: {email}", dry_run=True)
+        return
+
+    report_topic_arn = f"arn:aws:sns:{ctx.region}:{ctx.get_account_id()}:{REPORT_TOPIC_NAME}"
+
+    try:
+        paginator = ctx.sns.get_paginator("list_subscriptions_by_topic")
+        for page in paginator.paginate(TopicArn=report_topic_arn):
+            for sub in page.get("Subscriptions", []):
+                if sub.get("Protocol") == "email" and sub.get("Endpoint") == email:
+                    sub_arn = sub.get("SubscriptionArn", "")
+                    if sub_arn and sub_arn != "PendingConfirmation":
+                        ctx.sns.unsubscribe(SubscriptionArn=sub_arn)
+                        log(f"Removed email subscription: {email}")
+                        return
+                    elif sub_arn == "PendingConfirmation":
+                        log(f"Subscription pending confirmation, cannot remove: {email}")
+                        return
+        log(f"Email subscription not found: {email}")
+    except ClientError as err:
+        if "NotFound" in str(err):
+            log(f"Report topic not found: {REPORT_TOPIC_NAME}")
+        else:
+            raise RuntimeError(f"Failed to remove subscription: {err}") from err
 
 
 def delete(ctx: DeploymentContext):
@@ -424,22 +496,28 @@ def delete(ctx: DeploymentContext):
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(description="Deploy unauthorized API call alerting")
-    parser.add_argument("--email", help="Email for alerts (required unless --dry-run or --delete)")
+    parser.add_argument("--email", help="Email for alerts (required for deploy)")
     parser.add_argument("--region", default="us-east-1", help="AWS region (default: us-east-1)")
     parser.add_argument("--dry-run", action="store_true", help="Preview changes")
     parser.add_argument("--delete", action="store_true", help="Delete all resources")
+    parser.add_argument("--remove-email", metavar="EMAIL", help="Remove an email subscription")
 
     args = parser.parse_args()
 
-    if not args.delete and not args.dry_run and not args.email:
-        parser.error("--email is required unless using --dry-run or --delete")
+    # Validate arguments
+    if args.remove_email and args.delete:
+        parser.error("--remove-email and --delete cannot be used together")
+    if not args.delete and not args.remove_email and not args.dry_run and not args.email:
+        parser.error("--email is required for deployment")
 
     try:
         ctx = DeploymentContext(region=args.region, dry_run=args.dry_run)
         if args.delete:
             delete(ctx)
+        elif args.remove_email:
+            remove_email_subscription(ctx, args.remove_email)
         else:
-            deploy(ctx, args.email)
+            deploy(ctx, args.email or "")
     except RuntimeError as err:
         print(f"Error: {err}", file=sys.stderr)
         sys.exit(1)
